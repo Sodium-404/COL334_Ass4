@@ -7,9 +7,6 @@ import struct
 import threading
 from collections import defaultdict
 
-
-
-
 class ReliableUDPServer:
     def __init__(self, server_ip, server_port, sws):
         self.server_ip = server_ip
@@ -21,7 +18,6 @@ class ReliableUDPServer:
         # Packet management
         self.all_packets = {}  # {seq_num: (packet_data, timestamp)}
         self.acked_packets = set()  # Set of acknowledged packet numbers
-        self.next_to_send = 0
         
         # SACK-specific
         self.sack_ranges = []  # List of (start, length) tuples
@@ -36,13 +32,14 @@ class ReliableUDPServer:
         self.alpha = 0.125
         self.beta = 0.25
         
+        # Fast retransmit optimization
+        self.ahead_acked_count = defaultdict(int)
+        self.urgent_retransmit = set()
+        
         self.lock = threading.Lock()
         self.running = True
         self.eof_acked = False
         self.client_addr = None
-        self.ahead_acked_count = defaultdict(int)
-        self.urgent_retransmit = set() # set of sequence numbers to retransmit early
-
         
     def make_packet(self, seq_num, data):
         """Create packet with header"""
@@ -82,28 +79,60 @@ class ReliableUDPServer:
         self.timeout_interval = self.estimated_rtt + 3 * self.dev_rtt
         self.timeout_interval = max(self.min_timeout, min(self.timeout_interval, self.max_timeout))
     
-    def get_missing_packets(self, total_packets):
-        """Determine which packets need to be (re)transmitted based on SACK"""
-        with self.lock:
-            missing = set()
-            
-            # All packets before next_expected that aren't acked
-            for seq in range(self.next_expected):
+    def update_acked_from_sack_ranges(self, sack_ranges, total_packets):
+        """Efficiently update acked packets from SACK ranges"""
+        new_acks = set()
+        for start, length in sack_ranges:
+            end = min(start + length, total_packets)
+            for seq in range(start, end):
                 if seq not in self.acked_packets:
-                    missing.add(seq)
+                    self.acked_packets.add(seq)
+                    new_acks.add(seq)
+        return new_acks
+    
+    def process_fast_retransmit(self, new_acks):
+        """Efficient fast retransmit: O(n*k) where k is lookback window"""
+        LOOKBACK_WINDOW = 20  # Only check 20 packets behind each new ACK
+        
+        for acked_seq in sorted(new_acks):
+            # Look back only LOOKBACK_WINDOW packets from this ack
+            start_seq = max(0, acked_seq - LOOKBACK_WINDOW)
             
-            # Check packets in SACK ranges - mark as acked
-            for start, length in self.sack_ranges:
-                for seq in range(start, start + length):
-                    if seq < total_packets:
-                        self.acked_packets.add(seq)
+            # Find first unacked packet in this window
+            for prior_seq in range(start_seq, acked_seq):
+                if prior_seq not in self.acked_packets:
+                    self.ahead_acked_count[prior_seq] += 1
+                    
+                    # Trigger urgent retransmit after 3 packets acked ahead of it
+                    if self.ahead_acked_count[prior_seq] >= 3:
+                        if prior_seq not in self.urgent_retransmit:
+                            self.urgent_retransmit.add(prior_seq)
+                        self.ahead_acked_count[prior_seq] = 0
+                    
+                    # Only increment for first missing packet in window
+                    break
+    
+    def get_missing_packets_prioritized(self, total_packets):
+        """Get missing packets prioritized by proximity to next_expected"""
+        with self.lock:
+            # Separate urgent (fast retransmit) and normal missing packets
+            urgent = []
+            near_expected = []  # Close to next_expected
+            far_missing = []    # Far from next_expected
             
-            # All packets not in acked_packets need transmission
+            NEAR_THRESHOLD = self.sws * 2  # Define "near" as 2x window size
+            
             for seq in range(total_packets):
                 if seq not in self.acked_packets:
-                    missing.add(seq)
+                    if seq in self.urgent_retransmit:
+                        urgent.append(seq)
+                    elif seq < self.next_expected + NEAR_THRESHOLD:
+                        near_expected.append(seq)
+                    else:
+                        far_missing.append(seq)
             
-            return sorted(missing)
+            # Priority: urgent first, then near expected, then far
+            return urgent + near_expected + far_missing
     
     def send_data(self, data_bytes):
         """Send data using SACK-based protocol"""
@@ -125,7 +154,7 @@ class ReliableUDPServer:
         sack_thread.start()
         
         # Main sending loop
-        last_send_time = {}  # Track when each packet was last sent
+        last_progress_report = time.time()
         
         while True:
             with self.lock:
@@ -133,64 +162,64 @@ class ReliableUDPServer:
                 if len(self.acked_packets) >= total_packets:
                     print("All packets acknowledged via SACK")
                     break
-            
-            # Get list of missing packets
-            missing_packets = self.get_missing_packets(total_packets)
+                
+
+            # Get prioritized list of missing packets
+            missing_packets = self.get_missing_packets_prioritized(total_packets)
             
             # Send missing packets within window
             packets_sent = 0
             current_time = time.time()
             
             for seq in missing_packets[:self.sws]:
-                current_time = time.time()
                 urgent = False
-
-                # Atomically check-and-remove urgent flag
+                
+                # Check if this is an urgent retransmit
                 with self.lock:
                     if seq in self.urgent_retransmit:
                         urgent = True
                         self.urgent_retransmit.remove(seq)
-
-                # If not urgent, apply normal timeout/first-send rule
+                
+                # Apply timeout check for non-urgent packets
                 if not urgent:
-                    if seq in last_send_time and (current_time - last_send_time[seq]) < self.timeout_interval:
-                        # Not timed out yet, skip for now
-                        continue
-
-                # Send packet (either urgent, first-time, or timed out)
-                packet, _ = self.all_packets[seq]
+                    with self.lock:
+                        _, send_time = self.all_packets[seq]
+                        if send_time is not None and (current_time - send_time) < self.timeout_interval:
+                            continue
+                
+                # Send packet
+                with self.lock:
+                    packet, _ = self.all_packets[seq]
+                
                 try:
                     self.sock.sendto(packet, self.client_addr)
+                    
+                    with self.lock:
+                        self.all_packets[seq] = (packet, current_time)
+                        # Reset ahead ack counter after retransmit
+                        self.ahead_acked_count[seq] = 0
+                    
+                    packets_sent += 1
+                    if packets_sent >= self.sws:
+                        break
+                        
                 except Exception as e:
                     print(f"Error sending packet {seq}: {e}")
                     continue
-
-                last_send_time[seq] = current_time
-
-                with self.lock:
-                    # update send timestamp in the authoritative map
-                    self.all_packets[seq] = (packet, current_time)
-                    # reset early-retransmit counter for this seq so it won't retrigger immediately
-                    self.ahead_acked_count[seq] = 0
-
-                packets_sent += 1
-                if packets_sent >= self.sws:
-                    break
-
             
             # Small delay to avoid busy waiting
-            time.sleep(0.005)
+            time.sleep(0.001)
         
         print("Data transfer complete")
     
     def receive_sacks(self, total_packets):
         """Receive and process SACK packets"""
         self.sock.settimeout(0.05)
-
+        
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(1200)
-
+                
                 # Check for EOF ACK
                 if len(data) >= 4:
                     ack_value = struct.unpack('!I', data[:4])[0]
@@ -199,72 +228,59 @@ class ReliableUDPServer:
                             self.eof_acked = True
                         print("Received EOF ACK")
                         continue
-
+                
                 # Parse SACK
                 next_expected, sack_ranges = self.parse_sack(data)
                 if next_expected is None:
                     continue
-
+                
                 with self.lock:
                     old_next_expected = self.next_expected
-                    # Advance next_expected only forward
                     self.next_expected = max(self.next_expected, next_expected)
-
-                    # Collect newly acked packets (both by cumulative ACK and by SACK ranges)
+                    
                     new_acks = set()
-
-                    # Newly acked by cumulative advance
+                    
+                    # Process cumulative ACK
                     for seq in range(old_next_expected, self.next_expected):
                         if seq < total_packets and seq not in self.acked_packets:
                             self.acked_packets.add(seq)
                             new_acks.add(seq)
-
-                    # Update SACK ranges and collect newly acked from them
+                    
+                    # Process SACK ranges
                     self.sack_ranges = sack_ranges
-                    for start, length in sack_ranges:
-                        for seq in range(start, start + length):
-                            if seq < total_packets and seq not in self.acked_packets:
-                                self.acked_packets.add(seq)
-                                new_acks.add(seq)
-
-                    # For every newly acked packet, increment counters for prior unacked packets
-                    # (the naive O(n^2) approach; acceptable for moderate window sizes)
-                    for acked_seq in new_acks:
-                        for prior_seq in range(acked_seq):
-                            if prior_seq not in self.acked_packets:
-                                self.ahead_acked_count[prior_seq] += 1
-                                # When it reaches 3, schedule an urgent retransmit and reset the counter
-                                if self.ahead_acked_count[prior_seq] >= 3:
-                                    self.ahead_acked_count[prior_seq] = 0
-                                    self.urgent_retransmit.add(prior_seq)
-
-                    # Update RTT if we got new cumulative acknowledgments (as before)
+                    sack_new_acks = self.update_acked_from_sack_ranges(sack_ranges, total_packets)
+                    new_acks.update(sack_new_acks)
+                    
+                    # Process fast retransmit detection
+                    if new_acks:
+                        self.process_fast_retransmit(new_acks)
+                    
+                    # Update RTT based on cumulative ACK advancement
                     if self.next_expected > old_next_expected:
                         for seq in range(old_next_expected, self.next_expected):
                             if seq in self.all_packets and self.all_packets[seq][1]:
                                 sample_rtt = time.time() - self.all_packets[seq][1]
                                 self.update_rtt(sample_rtt)
                                 break
-
+            
             except socket.timeout:
                 continue
             except Exception as e:
                 if self.running:
                     print(f"Error receiving SACK: {e}")
                 break
-
     
     def send_eof(self):
         """Send EOF and wait for ACK"""
         eof_packet = self.make_packet(0xFFFFFFFF, b'EOF')
-        max_attempts = 5
+        max_attempts = 10
         attempt = 0
         
         print("Sending EOF...")
         
         while not self.eof_acked and attempt < max_attempts:
             self.sock.sendto(eof_packet, self.client_addr)
-            time.sleep(0.05)
+            time.sleep(0.2)
             attempt += 1
         
         if self.eof_acked:
@@ -277,8 +293,7 @@ class ReliableUDPServer:
     def run(self):
         """Main server loop"""
         print(f"Server listening on {self.server_ip}:{self.server_port}")
-        print(f"Using SACK only (no cumulative ACKs)")
-        print(f"Window size: {self.sws} packets")
+        print(f"Window size: {self.sws} packets ({self.sws * 1180} bytes)")
         
         try:
             # Wait for client request
@@ -299,7 +314,11 @@ class ReliableUDPServer:
             self.send_data(file_data)
             end_time = time.time()
             
-            print(f"Transfer time: {end_time - start_time:.2f} seconds")
+            transfer_time = end_time - start_time
+            throughput = (len(file_data) * 8) / transfer_time / 1e6 if transfer_time > 0 else 0
+            
+            print(f"Transfer time: {transfer_time:.2f} seconds")
+            print(f"Throughput: {throughput:.2f} Mbps")
             
             # Send EOF
             self.send_eof()
@@ -308,7 +327,7 @@ class ReliableUDPServer:
             print("\nServer interrupted")
         finally:
             self.running = False
-            time.sleep(0.2)  # Let threads finish
+            time.sleep(0.2)
             self.sock.close()
             print("Server closed")
 
@@ -316,11 +335,7 @@ if __name__ == "__main__":
     if len(sys.argv) != 4:
         print("Usage: python3 p1_server.py <SERVER_IP> <SERVER_PORT> <SWS>")
         sys.exit(1)
-    # Open the log file
-    log_file = open("output.log", "w")
-
-    # Redirect standard output
-    sys.stdout = log_file
+    
     server_ip = sys.argv[1]
     server_port = int(sys.argv[2])
     sws = int(sys.argv[3])
@@ -330,4 +345,3 @@ if __name__ == "__main__":
     
     server = ReliableUDPServer(server_ip, server_port, sws_packets)
     server.run()
-    log_file.close()

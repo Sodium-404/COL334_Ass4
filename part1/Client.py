@@ -12,19 +12,18 @@ class ReliableUDPClient:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(2.0)
         
-        # Receiver state - using packet numbers (not byte offsets)
-        self.received_packets = set()  # Set of received packet sequence numbers
+        # Receiver state - using packet numbers
+        self.received_packets = set()
         self.file_complete = False
         
     def make_sack_packet(self):
         """Create SACK packet with selective acknowledgments.
         
         SACK packet format:
-        - Byte 0-3: Next expected packet number (first missing)
+        - Bytes 0-3: Next expected packet number (first missing)
         - Bytes 4-19: Up to 4 SACK ranges (each range is 2 bytes start + 2 bytes length)
         """
         if not self.received_packets:
-            # No packets received yet
             return struct.pack('!I', 0) + b'\x00' * 16
         
         sorted_packets = sorted(self.received_packets)
@@ -44,7 +43,7 @@ class ReliableUDPClient:
         
         for pkt in sorted_packets:
             if pkt < next_expected:
-                continue  # Skip packets before next_expected
+                continue
             
             if current_range_start is None:
                 current_range_start = pkt
@@ -68,6 +67,7 @@ class ReliableUDPClient:
         sack_data = struct.pack('!I', next_expected)
         
         for start, length in sack_ranges[:4]:
+            # Ensure values fit in 16 bits
             sack_data += struct.pack('!HH', start & 0xFFFF, length & 0xFFFF)
         
         # Pad remaining space
@@ -146,12 +146,13 @@ class ReliableUDPClient:
         self.send_sack()
     
     def write_file(self, packet_data_map):
-        """Write received data to file"""
+        """Write received data to file in order"""
         if not self.received_packets:
             return 0
         
         max_seq = max(self.received_packets)
         bytes_written = 0
+        missing_packets = []
         
         with open('received_data.txt', 'wb') as f:
             for seq in range(max_seq + 1):
@@ -159,7 +160,10 @@ class ReliableUDPClient:
                     f.write(packet_data_map[seq])
                     bytes_written += len(packet_data_map[seq])
                 else:
-                    print(f"Warning: Missing packet {seq}")
+                    missing_packets.append(seq)
+        
+        if missing_packets:
+            print(f"Warning: {len(missing_packets)} missing packets: {missing_packets[:10]}...")
         
         return bytes_written
     
@@ -174,12 +178,14 @@ class ReliableUDPClient:
         
         self.process_packet(first_packet, packet_data_map)
         
-        self.sock.settimeout(3.0)
+        self.sock.settimeout(2.0)
         
         packets_received = 1
+        duplicate_count = 0
         eof_count = 0
         consecutive_timeouts = 0
         last_activity = time.time()
+        last_progress_report = time.time()
         
         while not self.file_complete or eof_count < 3:
             try:
@@ -189,6 +195,11 @@ class ReliableUDPClient:
                 consecutive_timeouts = 0
                 
                 seq_num, packet_data = self.parse_packet(data)
+                
+                # Track duplicates
+                if seq_num in self.received_packets and seq_num != 0xFFFFFFFF:
+                    duplicate_count += 1
+                
                 if seq_num == 0xFFFFFFFF and packet_data == b'EOF':
                     eof_count += 1
                 
@@ -197,12 +208,11 @@ class ReliableUDPClient:
                 if self.file_complete and eof_count >= 3:
                     break
                 
-                if packets_received % 200 == 0:
-                    print(f"Received {packets_received} packets, {len(self.received_packets)} unique")
                 
             except socket.timeout:
                 consecutive_timeouts += 1
                 
+                # Send SACK on timeout to trigger retransmissions
                 if not self.file_complete:
                     self.send_sack()
                 
@@ -211,13 +221,13 @@ class ReliableUDPClient:
                     break
                 
                 if time.time() - last_activity > 15.0:
-                    print("Transfer timeout")
+                    print("Transfer timeout - no activity for 15 seconds")
                     break
                 
-                if consecutive_timeouts > 10:
-                    print("Too many timeouts")
+                if consecutive_timeouts > 20:
+                    print(f"Too many consecutive timeouts ({consecutive_timeouts})")
                     break
-                    
+                
                 continue
                 
             except Exception as e:
@@ -226,24 +236,37 @@ class ReliableUDPClient:
         
         if self.file_complete:
             bytes_written = self.write_file(packet_data_map)
-            print(f"Transfer complete! {packets_received} packets, {bytes_written} bytes")
+            unique_packets = len(self.received_packets)
+            total_bytes = unique_packets * 1180  # Approximate
+            dup_rate = (duplicate_count / packets_received * 100) if packets_received > 0 else 0
+            
+            print(f"\nTransfer complete!")
+            print(f"Total packets received: {packets_received}")
+            print(f"Unique packets: {unique_packets}")
+            print(f"Duplicate packets: {duplicate_count} ({dup_rate:.1f}%)")
+            print(f"Bytes written: {bytes_written}")
+            print(f"File saved to: received_data.txt")
+            
             return True
         else:
-            print("Transfer incomplete")
+            print("\nTransfer incomplete")
+            bytes_written = self.write_file(packet_data_map)
+            print(f"Partial data saved: {bytes_written} bytes")
             return False
     
     def run(self):
         """Main client"""
         print(f"Connecting to {self.server_ip}:{self.server_port}")
-        print("Using SACK only")
+        print("Using SACK-based reliable UDP")
         
         try:
             success = self.receive_file()
-            print("Download successful!" if success else "Download failed!")
+            print("\nDownload successful!" if success else "\nDownload failed!")
         except KeyboardInterrupt:
-            print("\nInterrupted")
+            print("\nInterrupted by user")
         finally:
             self.sock.close()
+            print("Connection closed")
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
