@@ -8,7 +8,7 @@ class ReliableUDPClient:
         self.server_ip = server_ip
         self.server_port = server_port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(2.0)
+        self.sock.settimeout(1.0)
         
         # Receiver state
         self.expected_seq = 0
@@ -126,7 +126,7 @@ class ReliableUDPClient:
         self.process_packet(first_packet)
         
         # Set timeout for subsequent packets
-        self.sock.settimeout(5.0)
+        self.sock.settimeout(1.0)
         
         # Receive remaining packets
         last_activity = time.time()

@@ -46,16 +46,16 @@ class ReliableUDPServer:
     
     def update_rtt(self, sample_rtt):
         """Update RTO based on measured RTT"""
-        with self.lock:
-            if self.estimated_rtt == 0.5:  # First measurement
-                self.estimated_rtt = sample_rtt
-                self.dev_rtt = sample_rtt / 2
-            else:
-                self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample_rtt
-                self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(sample_rtt - self.estimated_rtt)
-            
-            self.timeout_interval = self.estimated_rtt + 4 * self.dev_rtt
-            self.timeout_interval = max(0.5, min(self.timeout_interval, 3.0))
+        # Lock is already held by caller
+        if self.estimated_rtt == 0.5:  # First measurement
+            self.estimated_rtt = sample_rtt
+            self.dev_rtt = sample_rtt / 2
+        else:
+            self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample_rtt
+            self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(sample_rtt - self.estimated_rtt)
+        
+        self.timeout_interval = self.estimated_rtt + 4 * self.dev_rtt
+        self.timeout_interval = max(0.2, min(self.timeout_interval, 1.0))
     
     def send_data(self, data_bytes):
         """Send data using sliding window protocol"""
@@ -64,6 +64,7 @@ class ReliableUDPServer:
         total_chunks = len(chunks)
         
         print(f"Sending {len(data_bytes)} bytes in {total_chunks} packets")
+        print(f"Window size allows {self.sws // chunk_size} packets in flight")
         
         # Prepare all packets
         for i, chunk in enumerate(chunks):
@@ -77,16 +78,22 @@ class ReliableUDPServer:
         ack_thread.start()
         
         # Sending loop
-        while self.base < total_chunks:
+        while True:
             with self.lock:
+                # Check if we're done
+                if self.base >= total_chunks:
+                    break
+                
                 # Send packets within window
-                while self.next_seq < total_chunks and (self.next_seq - self.base) * chunk_size < self.sws:
+                # FIX: Check if sending next_seq would keep us within window
+                while (self.next_seq < total_chunks and 
+                       (self.next_seq - self.base + 1) * chunk_size <= self.sws):
                     packet, _ = self.all_packets[self.next_seq]
                     self.sock.sendto(packet, self.client_addr)
                     self.all_packets[self.next_seq] = (packet, time.time())
                     self.next_seq += 1
                 
-                # Check for timeouts
+                # Check for timeouts on base packet
                 if self.base < total_chunks:
                     current_time = time.time()
                     packet, send_time = self.all_packets[self.base]
@@ -95,7 +102,7 @@ class ReliableUDPServer:
                         self.sock.sendto(packet, self.client_addr)
                         self.all_packets[self.base] = (packet, current_time)
             
-            time.sleep(0.001)  # Small delay to prevent busy waiting
+            time.sleep(0.0001)  # Small delay to prevent busy waiting
         
         print("All packets acknowledged")
     
@@ -123,7 +130,7 @@ class ReliableUDPServer:
                     # Cumulative ACK: ack_num is next expected sequence number
                     if ack_num > self.base:
                         # Calculate RTT for packets being acknowledged
-                        for seq in range(self.base, ack_num):
+                        for seq in range(self.base, min(ack_num, len(self.all_packets))):
                             if seq in self.all_packets and self.all_packets[seq][1]:
                                 sample_rtt = time.time() - self.all_packets[seq][1]
                                 self.update_rtt(sample_rtt)
@@ -133,13 +140,14 @@ class ReliableUDPServer:
                         self.duplicate_acks.clear()
                         last_ack = ack_num
                     
-                    elif ack_num == last_ack:
+                    elif ack_num == last_ack and ack_num < len(self.all_packets):
                         # Duplicate ACK
                         self.duplicate_acks[ack_num] = self.duplicate_acks.get(ack_num, 0) + 1
                         
                         # Fast retransmit after 3 duplicate ACKs
                         if self.duplicate_acks[ack_num] == 3:
                             if ack_num < len(self.all_packets):
+                                self.duplicate_acks[ack_num] = 0
                                 print(f"Fast retransmit: packet {ack_num}")
                                 packet, _ = self.all_packets[ack_num]
                                 self.sock.sendto(packet, self.client_addr)

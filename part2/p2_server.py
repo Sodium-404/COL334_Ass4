@@ -124,7 +124,8 @@ class ReliableUDPServer:
                 if self.cwnd < self.ssthresh:
                     # Slow start: exponential growth
                     self.cwnd += newly_acked
-                    print(f"Slow start: cwnd={self.cwnd:.2f} MSS ({self.get_cwnd_bytes()} bytes)")
+                    if self.base % 10 == 0:  # Print every 10 packets to reduce spam
+                        print(f"Slow start: cwnd={self.cwnd:.2f} MSS ({self.get_cwnd_bytes()} bytes)")
                 else:
                     # Congestion avoidance: CUBIC
                     self.ack_count += newly_acked
@@ -133,7 +134,8 @@ class ReliableUDPServer:
                     if self.ack_count >= cnt:
                         self.cwnd += 1
                         self.ack_count = 0
-                        print(f"Congestion avoidance (CUBIC): cwnd={self.cwnd:.2f} MSS ({self.get_cwnd_bytes()} bytes)")
+                        if self.base % 50 == 0:  # Print every 50 packets to reduce spam
+                            print(f"Congestion avoidance (CUBIC): cwnd={self.cwnd:.2f} MSS ({self.get_cwnd_bytes()} bytes)")
             
             # Clear duplicate ACK counter
             self.duplicate_acks.clear()
@@ -195,6 +197,7 @@ class ReliableUDPServer:
         
         print(f"Sending {len(data_bytes)} bytes in {total_chunks} packets")
         print(f"Initial cwnd: {self.cwnd} MSS ({self.get_cwnd_bytes()} bytes)")
+        print(f"Max window size: {self.max_sws} bytes ({self.max_sws // self.mss} packets)")
         
         # Prepare all packets
         for i, chunk in enumerate(chunks):
@@ -207,16 +210,26 @@ class ReliableUDPServer:
         ack_thread.start()
         
         # Sending loop
-        while self.base < total_chunks:
+        while True:
             with self.lock:
+                # Check if we're done
+                if self.base >= total_chunks:
+                    break
+                
                 # Send packets within congestion window
                 cwnd_bytes = self.get_cwnd_bytes()
+                
+                # FIX: Check if the NEXT packet we want to send fits in the window
+                # Calculate bytes already in flight
+                bytes_in_flight = (self.next_seq - self.base) * self.mss
+                
                 while (self.next_seq < total_chunks and 
-                       (self.next_seq - self.base) * self.mss < cwnd_bytes):
+                       bytes_in_flight + self.mss <= cwnd_bytes):
                     packet, _ = self.all_packets[self.next_seq]
                     self.sock.sendto(packet, self.client_addr)
                     self.all_packets[self.next_seq] = (packet, time.time())
                     self.next_seq += 1
+                    bytes_in_flight += self.mss
                 
                 # Check for timeout on base packet
                 if self.base < total_chunks:
