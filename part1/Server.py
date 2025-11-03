@@ -11,13 +11,14 @@ class ReliableUDPServer:
     def __init__(self, server_ip, server_port, sws):
         self.server_ip = server_ip
         self.server_port = server_port
-        self.sws = sws  # Sender window size in packets
+        self.sws = sws  # Sender window size in packets (UNIQUE unacked packets)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.server_ip, self.server_port))
         
         # Packet management
         self.all_packets = {}  # {seq_num: (packet_data, timestamp)}
         self.acked_packets = set()  # Set of acknowledged packet numbers
+        self.next_to_send = 0  # Next NEW packet to send
         
         # SACK-specific
         self.sack_ranges = []  # List of (start, length) tuples
@@ -32,7 +33,7 @@ class ReliableUDPServer:
         self.alpha = 0.125
         self.beta = 0.25
         
-        # Fast retransmit optimization
+        # Fast retransmit optimization (3 duplicate ACKs)
         self.ahead_acked_count = defaultdict(int)
         self.urgent_retransmit = set()
         
@@ -112,27 +113,40 @@ class ReliableUDPServer:
                     # Only increment for first missing packet in window
                     break
     
-    def get_missing_packets_prioritized(self, total_packets):
-        """Get missing packets prioritized by proximity to next_expected"""
+    def get_packets_to_send(self, total_packets):
+        """Get packets to send: retransmits (unlimited) + new packets (window limited)"""
         with self.lock:
-            # Separate urgent (fast retransmit) and normal missing packets
-            urgent = []
-            near_expected = []  # Close to next_expected
-            far_missing = []    # Far from next_expected
+            # Calculate current window usage (unique unacked packets that have been sent)
+            unacked_sent_count = len([seq for seq in range(self.next_to_send) 
+                                      if seq not in self.acked_packets])
             
-            NEAR_THRESHOLD = self.sws * 2  # Define "near" as 2x window size
-            
-            for seq in range(total_packets):
+            # Priority 1: Urgent retransmits (fast retransmit - 3 dup ACKs)
+            urgent_retrans = []
+            for seq in list(self.urgent_retransmit):
                 if seq not in self.acked_packets:
-                    if seq in self.urgent_retransmit:
-                        urgent.append(seq)
-                    elif seq < self.next_expected + NEAR_THRESHOLD:
-                        near_expected.append(seq)
-                    else:
-                        far_missing.append(seq)
+                    urgent_retrans.append(seq)
             
-            # Priority: urgent first, then near expected, then far
-            return urgent + near_expected + far_missing
+            # Priority 2: Timeout retransmits
+            timeout_retrans = []
+            current_time = time.time()
+            for seq in range(self.next_to_send):
+                if seq not in self.acked_packets and seq not in self.urgent_retransmit:
+                    _, send_time = self.all_packets[seq]
+                    if send_time is not None and (current_time - send_time) >= self.timeout_interval:
+                        timeout_retrans.append(seq)
+            
+            # Priority 3: New packets (within window limit)
+            new_packets = []
+            available_window = self.sws - unacked_sent_count
+            
+            # Send new packets up to window limit
+            while self.next_to_send < total_packets and len(new_packets) < available_window:
+                if self.next_to_send not in self.acked_packets:
+                    new_packets.append(self.next_to_send)
+                self.next_to_send += 1
+            
+            # Return: retransmits (unlimited) + new packets (window limited)
+            return urgent_retrans + timeout_retrans + new_packets
     
     def send_data(self, data_bytes):
         """Send data using SACK-based protocol"""
@@ -141,7 +155,7 @@ class ReliableUDPServer:
         total_packets = len(chunks)
         
         print(f"Sending {len(data_bytes)} bytes in {total_packets} packets")
-        print(f"Window size: {self.sws} packets")
+        print(f"Window size: {self.sws} packets (unique unacked)")
         
         # Prepare all packets
         for seq, chunk in enumerate(chunks):
@@ -154,54 +168,31 @@ class ReliableUDPServer:
         sack_thread.start()
         
         # Main sending loop
-        last_progress_report = time.time()
-        
         while True:
             with self.lock:
                 # Check if all packets are acknowledged
                 if len(self.acked_packets) >= total_packets:
                     print("All packets acknowledged via SACK")
                     break
-                
-
-            # Get prioritized list of missing packets
-            missing_packets = self.get_missing_packets_prioritized(total_packets)
             
-            # Send missing packets within window
-            packets_sent = 0
+            # Get packets to send (retransmits unlimited + new within window)
+            packets_to_send = self.get_packets_to_send(total_packets)
+            
+            # Send all packets
             current_time = time.time()
-            
-            for seq in missing_packets[:self.sws]:
-                urgent = False
-                
-                # Check if this is an urgent retransmit
-                with self.lock:
-                    if seq in self.urgent_retransmit:
-                        urgent = True
-                        self.urgent_retransmit.remove(seq)
-                
-                # Apply timeout check for non-urgent packets
-                if not urgent:
-                    with self.lock:
-                        _, send_time = self.all_packets[seq]
-                        if send_time is not None and (current_time - send_time) < self.timeout_interval:
-                            continue
-                
-                # Send packet
+            for seq in packets_to_send:
                 with self.lock:
                     packet, _ = self.all_packets[seq]
+                    
+                    # Clear from urgent retransmit set
+                    self.urgent_retransmit.discard(seq)
                 
                 try:
                     self.sock.sendto(packet, self.client_addr)
                     
                     with self.lock:
                         self.all_packets[seq] = (packet, current_time)
-                        # Reset ahead ack counter after retransmit
                         self.ahead_acked_count[seq] = 0
-                    
-                    packets_sent += 1
-                    if packets_sent >= self.sws:
-                        break
                         
                 except Exception as e:
                     print(f"Error sending packet {seq}: {e}")
@@ -251,7 +242,7 @@ class ReliableUDPServer:
                     sack_new_acks = self.update_acked_from_sack_ranges(sack_ranges, total_packets)
                     new_acks.update(sack_new_acks)
                     
-                    # Process fast retransmit detection
+                    # Process fast retransmit detection (3 duplicate ACKs)
                     if new_acks:
                         self.process_fast_retransmit(new_acks)
                     
