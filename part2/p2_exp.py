@@ -272,7 +272,7 @@ def run_trial(output_handle, bw=100, loss=0, delay_c2_ms=5, udp_off_mean=None, i
 
 def experiment_fixed_bandwidth(exp_out, num_iterations=1):
 
-    bw_list = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+    bw_list = [100]
     RTT_seconds = RTT_MS / 1000.0
 
     for bw in bw_list:
