@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Part 2 Server: Reliable UDP file transfer with CUBIC congestion control + cwnd plotting
-DEEPLY CORRECTED VERSION: Proper concave phase that reaches w_max quickly
+OPTIMIZED VERSION: Single timer for base packet only
 """
 
 import socket
@@ -22,10 +22,10 @@ INITIAL_CWND = 1 * MSS  # 1 packet
 INITIAL_SSTHRESH = 128 * MSS  # 64 packets
 CWND_SAMPLE_INTERVAL = 0.1  # Sample cwnd every 0.1 second
 
-CUBIC_C = 400
+CUBIC_C = 10.0
 CUBIC_BETA = 0.8
 FAST_CONVERGENCE = True
-
+AW1=0
 
 class CubicCongestionControl:
     """CUBIC congestion control algorithm - DEEPLY CORRECTED"""
@@ -149,7 +149,7 @@ class CubicCongestionControl:
                 self.w_last_max = self.w_max
                 self.w_max = self.cwnd
             
-            self.cwnd = MSS
+            int(self.cwnd * 0.5)
             self.epoch_start = -1
             self.K = 0
             self.ack_count = 0
@@ -201,6 +201,9 @@ class ReliableUDPServer:
         self.sent_packets = {}
         self.dup_ack_count = {}
         self.client_addr = None
+        
+        # OPTIMIZATION: Single timer for base packet
+        self.timer_start = None  # Track when base packet was sent
 
         print(f"[Server] Started on {host}:{port}")
         print(f"[Server] Initial cwnd: {self.cc.cwnd / MSS:.1f} packets, ssthresh: {self.cc.ssthresh / MSS:.1f} packets")
@@ -273,7 +276,12 @@ class ReliableUDPServer:
     def send_packet(self, seq_num, data):
         packet = self.make_packet(seq_num, data)
         self.sock.sendto(packet, self.client_addr)
-        self.sent_packets[seq_num] = (data, time.time(), 0)
+        send_time = time.time()
+        self.sent_packets[seq_num] = (data, send_time, 0)
+        
+        # OPTIMIZATION: Start timer only when sending base packet
+        if seq_num == self.base:
+            self.timer_start = send_time
 
     def get_effective_window(self):
         inflight = (self.next_seq_num - self.base) * MSS
@@ -302,22 +310,34 @@ class ReliableUDPServer:
 
         while self.base < total_chunks:
             current_time = time.time()
+            
+            # Send new packets within window
             while self.next_seq_num < total_chunks and self.get_effective_window() >= MSS:
                 if self.next_seq_num not in self.sent_packets:
                     self.send_packet(self.next_seq_num, chunks[self.next_seq_num])
                 self.next_seq_num += 1
 
-            self.sock.settimeout(min(self.rto, 0.5))
+            # OPTIMIZATION: Set timeout based on base packet timer only
+            if self.timer_start is not None:
+                time_elapsed = current_time - self.timer_start
+                timeout_remaining = max(self.rto - time_elapsed, 0.01)
+                self.sock.settimeout(timeout_remaining)
+            else:
+                self.sock.settimeout(self.rto)
+            
             try:
                 ack_packet, addr = self.sock.recvfrom(1024)
                 ack_num, sack_blocks = self.parse_ack(ack_packet)
                 if ack_num is None:
                     continue
+                
+                # Update RTT using base packet (oldest unacked)
                 if ack_num > self.base and self.base in self.sent_packets:
                     send_time = self.sent_packets[self.base][1]
                     sample_rtt = time.time() - send_time
                     self.update_rtt(sample_rtt)
 
+                # Handle duplicate ACKs (fast retransmit)
                 if ack_num == last_ack:
                     if last_ack not in self.dup_ack_count:
                         self.dup_ack_count[last_ack] = 0
@@ -328,27 +348,47 @@ class ReliableUDPServer:
                         if last_ack < total_chunks:
                             self.send_packet(last_ack, chunks[last_ack])
                 else:
+                    # New ACK received - cumulative acknowledgment
                     if ack_num > self.base:
                         bytes_acked = (ack_num - self.base) * MSS
                         self.cc.on_ack(bytes_acked, self.estimated_rtt)
+                        
+                        # Clear all packets up to ack_num (cumulative ACK)
                         for seq in range(self.base, min(ack_num, total_chunks)):
                             self.sent_packets.pop(seq, None)
                             self.dup_ack_count.pop(seq, None)
+                        
+                        # Move base forward
                         self.base = ack_num
                         last_ack = ack_num
+                        
+                        # OPTIMIZATION: Restart timer for new base packet
+                        if self.base < total_chunks and self.base in self.sent_packets:
+                            self.timer_start = self.sent_packets[self.base][1]
+                        else:
+                            self.timer_start = None
 
+                # Handle SACK blocks
                 for sack_start, sack_end in sack_blocks:
                     for seq in range(sack_start, min(sack_end, total_chunks)):
                         self.sent_packets.pop(seq, None)
 
             except socket.timeout:
+                # OPTIMIZATION: Timeout only applies to base packet
                 if self.base < total_chunks:
-                    print(f"[Server] Timeout, retransmitting seq {self.base}")
+                    print(f"[Server] Timeout on base packet (seq {self.base}), retransmitting from base")
                     self.cc.on_loss_detected('timeout')
-                    for seq in range(self.base, min(self.next_seq_num, total_chunks)):
-                        if seq >= self.base and seq < total_chunks:
-                            self.send_packet(seq, chunks[seq])
+                    
+                    # Retransmit base packet (Go-Back-N style)
+                    # You can also implement selective retransmit here
+                    self.send_packet(self.base, chunks[self.base])
+                    
+                    # Optionally retransmit entire window (Go-Back-N)
+                    # for seq in range(self.base + 1, min(self.next_seq_num, total_chunks)):
+                    #     if seq < total_chunks:
+                    #         self.send_packet(seq, chunks[seq])
 
+            # Progress logging
             if current_time - last_print_time > 2.0:
                 progress = (self.base / total_chunks) * 100
                 elapsed = current_time - start_time
@@ -359,6 +399,7 @@ class ReliableUDPServer:
                       f"ssthresh={self.cc.ssthresh/MSS:.1f}, RTT={self.estimated_rtt:.3f}s")
                 last_print_time = current_time
 
+        # Send EOF
         eof_packet = self.make_packet(total_chunks, b"EOF")
         for _ in range(5):
             self.sock.sendto(eof_packet, self.client_addr)
