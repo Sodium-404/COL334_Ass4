@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
 Part 2 Client: Reliable UDP file receiver with ACK and SACK support
+CORRECTED: Reverted ack_interval to 0.01 for prompt ACKs to avoid timeouts
 """
-
 import socket
 import sys
 import struct
 import time
-
 # Constants
 MSS = 1180
 HEADER_SIZE = 20
 MAX_PACKET_SIZE = 1200
 INITIAL_TIMEOUT = 2.0
 MAX_RETRIES = 5
-
-
 class ReliableUDPClient:
     def __init__(self, server_ip, server_port, prefix):
         self.server_ip = server_ip
@@ -29,7 +26,7 @@ class ReliableUDPClient:
         self.max_received_seq = -1
         
         print(f"[Client] Connecting to {server_ip}:{server_port}")
-    
+   
     def parse_packet(self, packet):
         """Parse packet to extract sequence number and data"""
         if len(packet) < HEADER_SIZE:
@@ -39,7 +36,7 @@ class ReliableUDPClient:
         data = packet[HEADER_SIZE:]
         
         return seq_num, data
-    
+   
     def make_ack(self, ack_num):
         """Create ACK packet with cumulative ACK and SACK blocks"""
         # Build SACK blocks for out-of-order packets
@@ -89,12 +86,12 @@ class ReliableUDPClient:
             ack_packet += struct.pack('!II', 0, 0)
         
         return ack_packet
-    
+   
     def send_ack(self, ack_num):
         """Send ACK to server"""
         ack_packet = self.make_ack(ack_num)
         self.sock.sendto(ack_packet, (self.server_ip, self.server_port))
-    
+   
     def send_request(self):
         """Send file request to server"""
         request = b'\x01'  # Simple one-byte request
@@ -121,7 +118,7 @@ class ReliableUDPClient:
         
         print("[Client] Failed to connect after max retries")
         return None
-    
+   
     def receive_file(self, output_filename):
         """Receive file from server"""
         # Send request and get first packet
@@ -141,7 +138,8 @@ class ReliableUDPClient:
             self.send_ack(self.expected_seq)
         
         last_ack_time = time.time()
-        ack_interval = 0.01  # Send ACK every 10ms or when needed
+        # CORRECTED: Reverted to 0.01s for prompt ACKs (0.05 caused delayed ACKs leading to server timeouts)
+        ack_interval = 0.01
         consecutive_timeouts = 0
         max_consecutive_timeouts = 10
         
@@ -184,10 +182,10 @@ class ReliableUDPClient:
                     self.send_ack(self.expected_seq)
                     last_ack_time = current_time
                 
-                # Progress report
+                # Progress report - FIXED: Use actual bytes
                 if current_time - last_print_time > 2.0:
                     elapsed = current_time - start_time
-                    received_bytes = len(self.received_data) * MSS
+                    received_bytes = sum(len(d) for d in self.received_data.values())
                     throughput = (received_bytes * 8) / (elapsed * 1e6)
                     print(f"[Client] Received {len(self.received_data)} packets, expected_seq={self.expected_seq}, throughput={throughput:.2f} Mbps")
                     last_print_time = current_time
@@ -210,7 +208,7 @@ class ReliableUDPClient:
                         return False
                 
                 if consecutive_timeouts >= max_consecutive_timeouts:
-                    print("[Client] Too many consecutive timeouts")
+                    print(f"[Client] Too many consecutive timeouts ({consecutive_timeouts}), assuming complete")
                     if self.received_data:
                         print("[Client] Assuming transfer complete")
                         break
@@ -223,7 +221,7 @@ class ReliableUDPClient:
                 for seq in sorted(self.received_data.keys()):
                     f.write(self.received_data[seq])
             
-            file_size = len(self.received_data) * MSS
+            file_size = sum(len(d) for d in self.received_data.values())  # FIXED: Actual size
             elapsed = time.time() - start_time
             throughput = (file_size * 8) / (elapsed * 1e6)
             
@@ -235,7 +233,7 @@ class ReliableUDPClient:
         except Exception as e:
             print(f"[Client] Error writing file: {e}")
             return False
-    
+   
     def run(self):
         """Main client loop"""
         output_filename = f"{self.prefix}received_data.txt"
@@ -248,8 +246,6 @@ class ReliableUDPClient:
             print("[Client] Transfer failed")
         
         return success
-
-
 def main():
     if len(sys.argv) != 4:
         print("Usage: python3 p2_client.py <SERVER_IP> <SERVER_PORT> <PREF_FILENAME>")
@@ -263,7 +259,5 @@ def main():
     success = client.run()
     
     sys.exit(0 if success else 1)
-
-
 if __name__ == "__main__":
     main()
