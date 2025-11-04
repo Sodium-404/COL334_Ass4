@@ -1,0 +1,20 @@
+[CLIENT] Debug logging enabled, writing to client_debug.log
+[CLIENT] Connecting to 10.0.0.1:6555
+[CLIENT] Handshake successful, received first packet
+[CLIENT] Starting data transfer, expected_seq=0
+[CLIENT] 🏁 Received EOF marker at seq=4294967295
+
+======================================================================
+[CLIENT STATS] @ 0.4s
+======================================================================
+  Received: 6 packets, 5.8 KB
+  Throughput: 13.01 KB/s
+  Expected seq: 5900, Buffer size: 0
+  In-order: 5, Out-of-order: 0, Duplicates: 0
+  ACKs sent: 7, Delayed ACKs skipped: 0
+  Timeouts: 2
+  Avg packets per select: 1.00, Max: 1
+======================================================================
+
+[CLIENT] ✅ Transfer complete in 0.44s
+[CLIENT] Final throughput: 13.01 KB/s
