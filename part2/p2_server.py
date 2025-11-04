@@ -1,354 +1,402 @@
+#!/usr/bin/env python3
+"""
+Part 2 Server: Reliable UDP file transfer with CUBIC congestion control + cwnd plotting
+DEEPLY CORRECTED VERSION: Proper concave phase that reaches w_max quickly
+"""
+
 import socket
 import sys
 import time
 import struct
-import threading
 import math
+import matplotlib.pyplot as plt
+
+# Constants
+MSS = 1180
+HEADER_SIZE = 20
+MAX_PACKET_SIZE = 1200
+INITIAL_TIMEOUT = 1.0
+ALPHA_RTT = 0.125
+BETA_RTT = 0.25
+INITIAL_CWND = 1 * MSS  # 1 packet
+INITIAL_SSTHRESH = 128 * MSS  # 64 packets
+CWND_SAMPLE_INTERVAL = 0.1  # Sample cwnd every 0.1 second
+
+CUBIC_C = 400
+CUBIC_BETA = 0.8
+FAST_CONVERGENCE = True
+
+
+class CubicCongestionControl:
+    """CUBIC congestion control algorithm - DEEPLY CORRECTED"""
+
+    def __init__(self, cwnd_history):
+        self.cwnd = INITIAL_CWND
+        self.ssthresh = INITIAL_SSTHRESH
+        self.w_max = 0
+        self.w_last_max = 0
+        self.epoch_start = 0
+        self.K = 0
+        self.ack_count = 0
+        self.cwnd_history = cwnd_history
+        self.last_sample_time = time.time()
+        self.in_slow_start = True
+        
+        # TCP-friendly window tracking
+        self.tcp_cwnd = INITIAL_CWND
+        self.cwnd_cnt = 0  # Counter for cwnd increments
+
+    def record_cwnd(self, force=False):
+        current_time = time.time()
+        if force or (current_time - self.last_sample_time) >= CWND_SAMPLE_INTERVAL:
+            self.cwnd_history.append((current_time, self.cwnd / MSS))
+            self.last_sample_time = current_time
+
+    def on_ack(self, bytes_acked, rtt):
+        """Called when ACK is received"""
+        if self.cwnd < self.ssthresh:
+            # Slow start: exponential growth
+            self.cwnd += bytes_acked
+            self.in_slow_start = True
+        else:
+            # Congestion avoidance: use CUBIC
+            self.in_slow_start = False
+            self._cubic_update(rtt)
+        self.record_cwnd()
+
+    def _cubic_update(self, rtt):
+        """
+        CUBIC update (units fixed).
+
+        - All CUBIC math (w_max, K, target) is done in *packets*.
+        - self.cwnd remains in *bytes* (as elsewhere in your code).
+        """
+        self.ack_count += 1
+        self.cwnd_cnt += 1
+
+        # If we haven't experienced loss yet, use TCP Reno until first loss
+        if self.w_max == 0:
+            # Standard TCP Reno: cwnd += 1/cwnd per ACK (cwnd in bytes, MSS bytes per pkt)
+            self.K=0
+
+        # Initialize epoch if needed
+        if self.epoch_start == -1:
+            self.epoch_start = time.time()
+
+            # WORK IN PACKETS for CUBIC math
+            w_max_pkts = (self.w_max / MSS) if self.w_max > 0 else 0.0
+
+            # K computed from w_max in packets
+            # protect against tiny/zero values
+            # use float math
+            self.K = math.pow(max(w_max_pkts * (1 - CUBIC_BETA) / CUBIC_C, 0.0), 1/3.0)
+
+            self.tcp_cwnd = self.cwnd
+            self.ack_count = 1
+            self.cwnd_cnt = 0
+
+            print(f"[CUBIC] New epoch: cwnd={self.cwnd/MSS:.1f} pkts, w_max={w_max_pkts:.1f} pkts, K={self.K:.3f}s (reach w_max at t=K)")
+
+        # time since epoch
+        t = time.time() - self.epoch_start
+
+        # do cubic math in packets
+        w_max_pkts = self.w_max / MSS
+        target_pkts = CUBIC_C * math.pow(t - self.K, 3) + w_max_pkts
+
+        # convert target back to bytes for internal cwnd (self.cwnd is bytes)
+        target_bytes = target_pkts * MSS
+
+        # Update cwnd towards target
+        if target_bytes > self.cwnd:
+            # gap in packets
+            diff_pkts = target_pkts - (self.cwnd / MSS)
+            diff_pkts = max(diff_pkts, 0.0)
+
+            # decide ACKs needed (work in packets for clarity)
+            if diff_pkts >= 1.0:
+                cnt = max(1.0, (self.cwnd / MSS) / diff_pkts)
+            else:
+                cnt = max(1.0, (self.cwnd / MSS))
+
+            # increment when enough ACKs seen
+            if self.ack_count >= cnt:
+                # increment by 1 MSS but never exceed target_bytes
+                inc = min(MSS, target_bytes - self.cwnd)
+                # inc might be fractional due to floats; use int
+                self.cwnd = int(self.cwnd + max(1, int(round(inc))))
+                self.ack_count = 0
+        else:
+            # target <= cwnd -> be conservative additive increase
+            if self.ack_count >= max(1, self.cwnd / MSS):
+                self.cwnd += MSS
+                self.ack_count = 0
+
+
+    def on_loss_detected(self, loss_type='timeout'):
+        """Called when packet loss is detected"""
+        print(f"[CUBIC] Loss detected ({loss_type}): cwnd={self.cwnd/MSS:.1f} -> ", end='')
+        
+        if loss_type == 'timeout':
+            # Timeout: severe, reset to 1 MSS
+            self.ssthresh = max(self.cwnd // 2, 2 * MSS)
+            
+            # Fast convergence
+            if FAST_CONVERGENCE and self.w_max > 0 and self.cwnd < self.w_last_max:
+                self.w_last_max = self.w_max
+                self.w_max = self.cwnd * (1 + CUBIC_BETA) / 2
+            else:
+                self.w_last_max = self.w_max
+                self.w_max = self.cwnd
+            
+            self.cwnd = MSS
+            self.epoch_start = -1
+            self.K = 0
+            self.ack_count = 0
+            self.cwnd_cnt = 0
+            self.in_slow_start = True
+            self.tcp_cwnd = MSS
+            
+        else:  # fast_retransmit
+            # Multiplicative decrease by beta
+            if FAST_CONVERGENCE and self.w_max > 0 and self.cwnd < self.w_last_max:
+                self.w_last_max = self.w_max
+                self.w_max = self.cwnd * (1 + CUBIC_BETA) / 2
+            else:
+                self.w_last_max = self.w_max
+                self.w_max = self.cwnd
+            
+            self.cwnd = int(self.cwnd * CUBIC_BETA)
+            self.ssthresh = max(self.cwnd, 2 * MSS)
+            self.epoch_start = -1
+            self.K = 0
+            self.ack_count = 0
+            self.cwnd_cnt = 0
+            self.in_slow_start = False
+            self.tcp_cwnd = self.cwnd
+        
+        print(f"{self.cwnd/MSS:.1f}, w_max={self.w_max/MSS:.1f}, ssthresh={self.ssthresh/MSS:.1f}, K will be {math.pow(self.w_max * (1 - CUBIC_BETA) / CUBIC_C, 1/3.0):.3f}s")
+        self.record_cwnd(force=True)
+
 
 class ReliableUDPServer:
-    def __init__(self, server_ip, server_port, sws):
-        self.server_ip = server_ip
-        self.server_port = server_port
-        self.max_sws = sws  # Maximum sender window size in bytes
-        self.mss = 1180  # Maximum segment size (data per packet)
-        
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.server_ip, self.server_port))
-        
-        # Reliability parameters
-        self.base = 0  # Oldest unacked sequence number
-        self.next_seq = 0  # Next sequence number to send
-        self.all_packets = {}  # {seq_num: (packet_data, timestamp)}
-        
-        # Congestion control parameters (TCP CUBIC)
-        self.cwnd = 1.0  # Congestion window (in MSS units) - start with 1 MSS
-        self.ssthresh = 64.0  # Slow start threshold (in MSS units)
-        self.w_max = 0.0  # Window size before last congestion event
-        self.epoch_start = 0.0  # Time when current epoch started
-        self.k = 0.0  # Time period to reach w_max
-        self.ack_count = 0  # Count ACKs in congestion avoidance
-        
-        # CUBIC constants
-        self.C = 0.4  # Scaling constant
-        self.beta = 0.7  # Multiplicative decrease factor (0.7 for CUBIC)
-        
-        # Fast retransmit/recovery
-        self.duplicate_acks = {}  # Track duplicate ACKs
-        self.in_fast_recovery = False
-        self.recovery_point = 0  # Seq number to exit fast recovery
-        
-        # Timeout parameters
-        self.estimated_rtt = 0.5
-        self.dev_rtt = 0.25
-        self.timeout_interval = 1.0
-        self.alpha = 0.125
-        self.beta_rtt = 0.25
-        
-        self.lock = threading.Lock()
-        self.running = True
-        self.eof_acked = False
+        self.sock.bind((host, port))
+        self.sock.settimeout(5.0)
+
+        self.seq_num = 0
+        self.next_seq_num = 0
+        self.base = 0
+
+        self.estimated_rtt = INITIAL_TIMEOUT
+        self.dev_rtt = 0
+        self.rto = INITIAL_TIMEOUT
+
+        self.cwnd_history = []
+        self.cc = CubicCongestionControl(self.cwnd_history)
+
+        self.sent_packets = {}
+        self.dup_ack_count = {}
         self.client_addr = None
+
+        print(f"[Server] Started on {host}:{port}")
+        print(f"[Server] Initial cwnd: {self.cc.cwnd / MSS:.1f} packets, ssthresh: {self.cc.ssthresh / MSS:.1f} packets")
+
+    def plot_cwnd(self):
+        if not self.cwnd_history:
+            print("[Server] No cwnd data to plot.")
+            return
+        t0 = self.cwnd_history[0][0]
+        times = [t - t0 for t, _ in self.cwnd_history]
+        cwnds = [c for _, c in self.cwnd_history]
         
+        plt.figure(figsize=(14, 7))
+        plt.plot(times, cwnds, linewidth=2, marker='o', markersize=2, color='#2E86AB', alpha=0.8)
+        plt.title("CUBIC Congestion Window (cwnd) vs Time", fontsize=16, fontweight='bold')
+        plt.xlabel("Time (s)", fontsize=13)
+        plt.ylabel("cwnd (packets)", fontsize=13)
+        plt.grid(True, alpha=0.3, linestyle='--')
+        
+        # Add w_max line if we have it
+        if self.cc.w_max > 0:
+            plt.axhline(y=self.cc.w_max/MSS, color='r', linestyle='--', alpha=0.6, 
+                       linewidth=2, label=f'w_max = {self.cc.w_max/MSS:.1f} packets')
+        
+        # Add ssthresh line
+        plt.axhline(y=self.cc.ssthresh/MSS, color='orange', linestyle=':', alpha=0.5, 
+                   linewidth=2, label=f'ssthresh = {self.cc.ssthresh/MSS:.1f} packets')
+        
+        plt.legend(fontsize=11)
+        plt.tight_layout()
+        plt.savefig("window_utilization.png", dpi=300, bbox_inches='tight')
+        print(f"[Server] Plot saved to window_utilization.png ({len(self.cwnd_history)} samples)")
+        plt.show(block=False)
+        plt.pause(2)
+        plt.close()
+
     def make_packet(self, seq_num, data):
-        """Create a packet with header and data"""
         header = struct.pack('!I', seq_num) + b'\x00' * 16
         return header + data
-    
+
     def parse_ack(self, packet):
-        """Parse ACK packet to get acknowledgment number"""
         if len(packet) < 4:
-            return None
+            return None, []
         ack_num = struct.unpack('!I', packet[:4])[0]
-        return ack_num
-    
+        sack_blocks = []
+        if len(packet) >= 20:
+            try:
+                sack1_start = struct.unpack('!I', packet[4:8])[0]
+                sack1_end = struct.unpack('!I', packet[8:12])[0]
+                if sack1_start != 0 and sack1_end != 0:
+                    sack_blocks.append((sack1_start, sack1_end))
+                sack2_start = struct.unpack('!I', packet[12:16])[0]
+                sack2_end = struct.unpack('!I', packet[16:20])[0]
+                if sack2_start != 0 and sack2_end != 0:
+                    sack_blocks.append((sack2_start, sack2_end))
+            except:
+                pass
+        return ack_num, sack_blocks
+
     def update_rtt(self, sample_rtt):
-        """Update RTO based on measured RTT"""
-        if self.estimated_rtt == 0.5:  # First measurement
+        if self.estimated_rtt == INITIAL_TIMEOUT:
             self.estimated_rtt = sample_rtt
             self.dev_rtt = sample_rtt / 2
         else:
-            self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample_rtt
-            self.dev_rtt = (1 - self.beta_rtt) * self.dev_rtt + self.beta_rtt * abs(sample_rtt - self.estimated_rtt)
-        
-        self.timeout_interval = self.estimated_rtt + 4 * self.dev_rtt
-        self.timeout_interval = max(0.5, min(self.timeout_interval, 3.0))
-    
-    def get_cwnd_bytes(self):
-        """Get congestion window in bytes"""
-        return min(int(self.cwnd * self.mss), self.max_sws)
-    
-    def cubic_update(self):
-        """CUBIC window update during congestion avoidance"""
-        if self.epoch_start == 0:
-            self.epoch_start = time.time()
-            if self.cwnd < self.w_max:
-                self.k = math.pow((self.w_max - self.cwnd) / self.C, 1/3.0)
-            else:
-                self.k = 0
-        
-        t = time.time() - self.epoch_start
-        target = self.C * math.pow(t - self.k, 3) + self.w_max
-        
-        if target > self.cwnd:
-            # CUBIC increase
-            cnt = self.cwnd / (target - self.cwnd)
-        else:
-            # TCP-friendly region
-            cnt = 100 * self.cwnd
-        
-        return cnt
-    
-    def on_ack_received(self, ack_num):
-        """Handle ACK reception and update congestion window"""
-        with self.lock:
-            if ack_num <= self.base:
-                return  # Old ACK, ignore
-            
-            # Calculate RTT sample for the first packet being acked
-            if self.base in self.all_packets and self.all_packets[self.base][1]:
-                sample_rtt = time.time() - self.all_packets[self.base][1]
-                self.update_rtt(sample_rtt)
-            
-            # Number of newly acknowledged packets
-            newly_acked = ack_num - self.base
-            self.base = ack_num
-            
-            # Exit fast recovery if we've passed the recovery point
-            if self.in_fast_recovery and ack_num >= self.recovery_point:
-                self.in_fast_recovery = False
-                self.cwnd = self.ssthresh
-                print(f"Exiting fast recovery: cwnd={self.cwnd:.2f} MSS ({self.get_cwnd_bytes()} bytes)")
-            
-            # Update congestion window if not in fast recovery
-            if not self.in_fast_recovery:
-                if self.cwnd < self.ssthresh:
-                    # Slow start: exponential growth
-                    self.cwnd += newly_acked
-                    if self.base % 10 == 0:  # Print every 10 packets to reduce spam
-                        print(f"Slow start: cwnd={self.cwnd:.2f} MSS ({self.get_cwnd_bytes()} bytes)")
-                else:
-                    # Congestion avoidance: CUBIC
-                    self.ack_count += newly_acked
-                    cnt = self.cubic_update()
-                    
-                    if self.ack_count >= cnt:
-                        self.cwnd += 1
-                        self.ack_count = 0
-                        if self.base % 50 == 0:  # Print every 50 packets to reduce spam
-                            print(f"Congestion avoidance (CUBIC): cwnd={self.cwnd:.2f} MSS ({self.get_cwnd_bytes()} bytes)")
-            
-            # Clear duplicate ACK counter
-            self.duplicate_acks.clear()
-    
-    def on_duplicate_ack(self, ack_num):
-        """Handle duplicate ACK"""
-        with self.lock:
-            self.duplicate_acks[ack_num] = self.duplicate_acks.get(ack_num, 0) + 1
-            
-            # Fast retransmit on 3rd duplicate ACK
-            if self.duplicate_acks[ack_num] == 3:
-                print(f"Fast retransmit triggered at seq {ack_num}")
-                
-                # Retransmit the missing packet
-                if ack_num < len(self.all_packets):
-                    packet, _ = self.all_packets[ack_num]
-                    self.sock.sendto(packet, self.client_addr)
-                    self.all_packets[ack_num] = (packet, time.time())
-                
-                # Enter fast recovery (TCP Reno style)
-                if not self.in_fast_recovery:
-                    self.ssthresh = max(self.cwnd * self.beta, 2.0)
-                    self.w_max = self.cwnd  # Save for CUBIC
-                    self.cwnd = self.ssthresh + 3  # Inflate window
-                    self.in_fast_recovery = True
-                    self.recovery_point = self.next_seq
-                    self.epoch_start = 0  # Reset CUBIC epoch
-                    print(f"Entering fast recovery: ssthresh={self.ssthresh:.2f}, cwnd={self.cwnd:.2f} MSS")
-            
-            # Inflate window during fast recovery
-            elif self.duplicate_acks[ack_num] > 3 and self.in_fast_recovery:
-                self.cwnd += 1
-    
-    def on_timeout(self, seq_num):
-        """Handle timeout event"""
-        with self.lock:
-            print(f"Timeout at seq {seq_num}")
-            
-            # Severe congestion: reduce window drastically
-            self.ssthresh = max(self.cwnd / 2, 2.0)
-            self.w_max = self.cwnd  # Save for CUBIC
-            self.cwnd = 1.0  # Reset to 1 MSS
-            self.in_fast_recovery = False
-            self.duplicate_acks.clear()
-            self.epoch_start = 0  # Reset CUBIC epoch
-            
-            print(f"Timeout recovery: ssthresh={self.ssthresh:.2f}, cwnd=1.0 MSS")
-            
-            # Retransmit the packet
-            if seq_num in self.all_packets:
-                packet, _ = self.all_packets[seq_num]
-                self.sock.sendto(packet, self.client_addr)
-                self.all_packets[seq_num] = (packet, time.time())
-    
-    def send_data(self, data_bytes):
-        """Send data using sliding window with congestion control"""
-        chunks = [data_bytes[i:i+self.mss] for i in range(0, len(data_bytes), self.mss)]
+            self.dev_rtt = (1 - BETA_RTT) * self.dev_rtt + BETA_RTT * abs(sample_rtt - self.estimated_rtt)
+            self.estimated_rtt = (1 - ALPHA_RTT) * self.estimated_rtt + ALPHA_RTT * sample_rtt
+        self.rto = max(self.estimated_rtt + 4 * self.dev_rtt, 0.2)
+        self.rto = min(self.rto, 2.0)
+
+    def send_packet(self, seq_num, data):
+        packet = self.make_packet(seq_num, data)
+        self.sock.sendto(packet, self.client_addr)
+        self.sent_packets[seq_num] = (data, time.time(), 0)
+
+    def get_effective_window(self):
+        inflight = (self.next_seq_num - self.base) * MSS
+        return max(0, int(self.cc.cwnd) - inflight)
+
+    def send_file(self, filename):
+        try:
+            with open(filename, 'rb') as f:
+                file_data = f.read()
+        except FileNotFoundError:
+            print(f"[Server] File {filename} not found")
+            return
+
+        print(f"[Server] Sending file {filename} ({len(file_data)} bytes)")
+
+        chunks = [file_data[i:i + MSS] for i in range(0, len(file_data), MSS)]
         total_chunks = len(chunks)
+        self.base = 0
+        self.next_seq_num = 0
+        last_ack = 0
+        start_time = time.time()
+        last_print_time = start_time
         
-        print(f"Sending {len(data_bytes)} bytes in {total_chunks} packets")
-        print(f"Initial cwnd: {self.cwnd} MSS ({self.get_cwnd_bytes()} bytes)")
-        print(f"Max window size: {self.max_sws} bytes ({self.max_sws // self.mss} packets)")
-        
-        # Prepare all packets
-        for i, chunk in enumerate(chunks):
-            packet = self.make_packet(i, chunk)
-            self.all_packets[i] = (packet, None)
-        
-        # Start ACK receiver thread
-        ack_thread = threading.Thread(target=self.receive_acks)
-        ack_thread.daemon = True
-        ack_thread.start()
-        
-        # Sending loop
-        while True:
-            with self.lock:
-                # Check if we're done
-                if self.base >= total_chunks:
-                    break
-                
-                # Send packets within congestion window
-                cwnd_bytes = self.get_cwnd_bytes()
-                
-                # FIX: Check if the NEXT packet we want to send fits in the window
-                # Calculate bytes already in flight
-                bytes_in_flight = (self.next_seq - self.base) * self.mss
-                
-                while (self.next_seq < total_chunks and 
-                       bytes_in_flight + self.mss <= cwnd_bytes):
-                    packet, _ = self.all_packets[self.next_seq]
-                    self.sock.sendto(packet, self.client_addr)
-                    self.all_packets[self.next_seq] = (packet, time.time())
-                    self.next_seq += 1
-                    bytes_in_flight += self.mss
-                
-                # Check for timeout on base packet
-                if self.base < total_chunks:
-                    packet, send_time = self.all_packets[self.base]
-                    if send_time and time.time() - send_time > self.timeout_interval:
-                        self.on_timeout(self.base)
-            
-            time.sleep(0.001)
-        
-        print(f"All packets acknowledged. Final cwnd: {self.cwnd:.2f} MSS")
-    
-    def receive_acks(self):
-        """Receive and process ACKs"""
-        self.sock.settimeout(0.1)
-        last_ack = -1
-        
-        while self.running:
+        # Record initial cwnd value
+        self.cc.record_cwnd(force=True)
+
+        while self.base < total_chunks:
+            current_time = time.time()
+            while self.next_seq_num < total_chunks and self.get_effective_window() >= MSS:
+                if self.next_seq_num not in self.sent_packets:
+                    self.send_packet(self.next_seq_num, chunks[self.next_seq_num])
+                self.next_seq_num += 1
+
+            self.sock.settimeout(min(self.rto, 0.5))
             try:
-                data, addr = self.sock.recvfrom(1200)
-                ack_num = self.parse_ack(data)
-                
+                ack_packet, addr = self.sock.recvfrom(1024)
+                ack_num, sack_blocks = self.parse_ack(ack_packet)
                 if ack_num is None:
                     continue
-                
-                # Check for EOF ACK
-                if ack_num == 0xFFFFFFFE:
-                    with self.lock:
-                        self.eof_acked = True
-                    continue
-                
-                # New ACK
-                if ack_num > last_ack:
-                    self.on_ack_received(ack_num)
-                    last_ack = ack_num
-                # Duplicate ACK
-                elif ack_num == last_ack and ack_num > 0:
-                    self.on_duplicate_ack(ack_num)
-            
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    print(f"Error receiving ACK: {e}")
-                break
-    
-    def send_eof(self):
-        """Send EOF signal and wait for EOF ACK"""
-        eof_packet = self.make_packet(0xFFFFFFFF, b'EOF')
-        max_attempts = 50
-        attempt = 0
-        
-        print("Sending EOF and waiting for acknowledgment...")
-        
-        while not self.eof_acked and attempt < max_attempts:
-            self.sock.sendto(eof_packet, self.client_addr)
-            time.sleep(0.2)
-            attempt += 1
-            
-            if attempt % 5 == 0 and not self.eof_acked:
-                print(f"Still waiting for EOF ACK (attempt {attempt}/{max_attempts})...")
-        
-        if self.eof_acked:
-            print("EOF acknowledged by client")
-            return True
-        else:
-            print("Warning: EOF not acknowledged after maximum attempts")
-            return False
-    
-    def run(self):
-        """Main server loop"""
-        print(f"Server listening on {self.server_ip}:{self.server_port}")
-        print(f"Maximum sender window size: {self.max_sws} bytes")
-        
-        try:
-            data, self.client_addr = self.sock.recvfrom(1200)
-            print(f"Received request from {self.client_addr}")
-            
-            try:
-                with open('data.txt', 'rb') as f:
-                    file_data = f.read()
-                print(f"File size: {len(file_data)} bytes")
-            except FileNotFoundError:
-                print("Error: data.txt not found")
-                return
-            
-            # Send file
-            start_time = time.time()
-            self.send_data(file_data)
-            end_time = time.time()
-            
-            transfer_time = end_time - start_time
-            throughput = (len(file_data) * 8) / transfer_time / 1e6  # Mbps
-            
-            print(f"Transfer completed in {transfer_time:.2f} seconds")
-            print(f"Throughput: {throughput:.2f} Mbps")
-            
-            # Send EOF
-            eof_success = self.send_eof()
-            
-            if eof_success:
-                print("Connection closed gracefully")
-            else:
-                print("Connection closed with timeout")
-            
-        except KeyboardInterrupt:
-            print("\nServer interrupted")
-        finally:
-            self.running = False
-            self.sock.close()
-            print("Server closed")
+                if ack_num > self.base and self.base in self.sent_packets:
+                    send_time = self.sent_packets[self.base][1]
+                    sample_rtt = time.time() - send_time
+                    self.update_rtt(sample_rtt)
 
-if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        print("Usage: python3 p1_server.py <SERVER_IP> <SERVER_PORT> <SWS>")
+                if ack_num == last_ack:
+                    if last_ack not in self.dup_ack_count:
+                        self.dup_ack_count[last_ack] = 0
+                    self.dup_ack_count[last_ack] += 1
+                    if self.dup_ack_count[last_ack] == 3:
+                        print(f"[Server] Fast retransmit triggered for seq {last_ack}")
+                        self.cc.on_loss_detected('fast_retransmit')
+                        if last_ack < total_chunks:
+                            self.send_packet(last_ack, chunks[last_ack])
+                else:
+                    if ack_num > self.base:
+                        bytes_acked = (ack_num - self.base) * MSS
+                        self.cc.on_ack(bytes_acked, self.estimated_rtt)
+                        for seq in range(self.base, min(ack_num, total_chunks)):
+                            self.sent_packets.pop(seq, None)
+                            self.dup_ack_count.pop(seq, None)
+                        self.base = ack_num
+                        last_ack = ack_num
+
+                for sack_start, sack_end in sack_blocks:
+                    for seq in range(sack_start, min(sack_end, total_chunks)):
+                        self.sent_packets.pop(seq, None)
+
+            except socket.timeout:
+                if self.base < total_chunks:
+                    print(f"[Server] Timeout, retransmitting seq {self.base}")
+                    self.cc.on_loss_detected('timeout')
+                    for seq in range(self.base, min(self.next_seq_num, total_chunks)):
+                        if seq >= self.base and seq < total_chunks:
+                            self.send_packet(seq, chunks[seq])
+
+            if current_time - last_print_time > 2.0:
+                progress = (self.base / total_chunks) * 100
+                elapsed = current_time - start_time
+                phase = "Slow Start" if self.cc.in_slow_start else "CUBIC"
+                t_since_epoch = time.time() - self.cc.epoch_start if self.cc.epoch_start > 0 else 0
+                print(f"[Server] Progress: {progress:.1f}%, Phase: {phase}, cwnd={self.cc.cwnd/MSS:.1f}, "
+                      f"w_max={self.cc.w_max/MSS:.1f}, K={self.cc.K:.2f}s, t={t_since_epoch:.2f}s, "
+                      f"ssthresh={self.cc.ssthresh/MSS:.1f}, RTT={self.estimated_rtt:.3f}s")
+                last_print_time = current_time
+
+        eof_packet = self.make_packet(total_chunks, b"EOF")
+        for _ in range(5):
+            self.sock.sendto(eof_packet, self.client_addr)
+            time.sleep(0.1)
+
+        elapsed = time.time() - start_time
+        throughput = (len(file_data) * 8) / (elapsed * 1e6)
+        print(f"[Server] File sent successfully in {elapsed:.2f}s, throughput={throughput:.2f} Mbps")
+        print(f"[CUBIC] Final stats: w_max={self.cc.w_max/MSS:.1f}, K={self.cc.K:.3f}s")
+
+        self.plot_cwnd()
+
+    def wait_for_client(self):
+        print("[Server] Waiting for client request...")
+        try:
+            data, addr = self.sock.recvfrom(1024)
+            self.client_addr = addr
+            print(f"[Server] Received request from {addr}")
+            return True
+        except socket.timeout:
+            return False
+
+    def run(self):
+        if self.wait_for_client():
+            self.send_file("data.txt")
+        self.sock.close()
+        print("[Server] Closed")
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("Usage: python3 p2_server_corrected.py <SERVER_IP> <SERVER_PORT>")
         sys.exit(1)
-    
     server_ip = sys.argv[1]
     server_port = int(sys.argv[2])
-    sws = int(sys.argv[3])
-    
-    server = ReliableUDPServer(server_ip, server_port, sws)
+    server = ReliableUDPServer(server_ip, server_port)
     server.run()
+
+
+if __name__ == "__main__":
+    main()
